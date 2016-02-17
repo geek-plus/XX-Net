@@ -3,68 +3,78 @@
 
 
 import errno
-import time
-import struct
-import zlib
-import functools
-import re
-import io
-import xlog
-import string
-import threading
 import socket
 import ssl
-import Queue
-import BaseHTTPServer
-import httplib
 import urlparse
-
-
-from cert_util import CertUtil
-from connect_manager import https_manager,forwork_manager
-from appids_manager import appid_manager
 
 import OpenSSL
 NetWorkIOError = (socket.error, ssl.SSLError, OpenSSL.SSL.Error, OSError)
 
 
+from xlog import getLogger
+xlog = getLogger("gae_proxy")
+import simple_http_client
+import simple_http_server
+from cert_util import CertUtil
 from config import config
 import gae_handler
 import direct_handler
-from connect_control import connect_allow_time, connect_fail_time, touch_active
+from connect_control import touch_active
 import web_control
 
-class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
-    #protocol_version = 'HTTP/1.1'
+
+class GAEProxyHandler(simple_http_server.HttpServerHandler):
     gae_support_methods = tuple(["GET", "POST", "HEAD", "PUT", "DELETE", "PATCH"])
     bufsize = 256*1024
     max_retry = 3
 
     def setup(self):
-        self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
         self.__class__.do_GET = self.__class__.do_METHOD
         self.__class__.do_PUT = self.__class__.do_METHOD
         self.__class__.do_POST = self.__class__.do_METHOD
         self.__class__.do_HEAD = self.__class__.do_METHOD
         self.__class__.do_DELETE = self.__class__.do_METHOD
         self.__class__.do_OPTIONS = self.__class__.do_METHOD
-        self.setup()
 
-    def finish(self):
-        """make python2 BaseHTTPRequestHandler happy"""
-        try:
-            BaseHTTPServer.BaseHTTPRequestHandler.finish(self)
-        except NetWorkIOError as e:
-            if e[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
-                raise
-
-    def address_string(self):
-        return '%s:%s' % self.client_address[:2]
+        self.self_check_response_data = "HTTP/1.1 200 OK\r\n"\
+               "Access-Control-Allow-Origin: *\r\n"\
+               "Content-Type: text/plain\r\n"\
+               "Content-Length: 2\r\n\r\nOK"
 
     def forward_local(self):
-        html = gae_handler.generate_message_html('Browser pass local request to proxy', u'您的浏览器把本地请求转发到代理上。<br>请在浏览器中设置：访问本地，不经过代理。<br><a href="https://github.com/XX-net/XX-Net/wiki/Browser-pass-localhost-request-to-proxy">帮助</a>')
-        gae_handler.send_response(self.wfile, 200, body=html.encode('utf-8'))
+        host = self.headers.get('Host', '')
+        host_ip, _, port = host.rpartition(':')
+        http_client = simple_http_client.HTTP_client((host_ip, int(port)))
 
+        request_headers = dict((k.title(), v) for k, v in self.headers.items())
+        payload = b''
+        if 'Content-Length' in request_headers:
+            try:
+                payload_len = int(request_headers.get('Content-Length', 0))
+                payload = self.rfile.read(payload_len)
+            except Exception as e:
+                xlog.warn('forward_local read payload failed:%s', e)
+                return
+
+        self.parsed_url = urlparse.urlparse(self.path)
+        if len(self.parsed_url[4]):
+            path = '?'.join([self.parsed_url[2], self.parsed_url[4]])
+        else:
+            path = self.parsed_url[2]
+        content, status, response = http_client.request(self.command, path, request_headers, payload)
+        if not status:
+            xlog.warn("forward_local fail")
+            return
+
+        out_list = []
+        out_list.append("HTTP/1.1 %d\r\n" % status)
+        for key, value in response.getheaders():
+            key = key.title()
+            out_list.append("%s: %s\r\n" % (key, value))
+        out_list.append("\r\n")
+        out_list.append(content)
+
+        self.wfile.write("".join(out_list))
 
     def do_METHOD(self):
         touch_active()
@@ -87,11 +97,16 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             host = urlparse.urlparse(self.path).netloc
 
         if host.startswith("127.0.0.1") or host.startswith("localhost"):
-            xlog.warn("Your browser forward localhost to proxy.")
+            #xlog.warn("Your browser forward localhost to proxy.")
             return self.forward_local()
 
-        self.parsed_url = urlparse.urlparse(self.path)
+        if self.path == "http://www.twitter.com/xxnet":
+            xlog.debug("%s %s", self.command, self.path)
+            # for web_ui status page
+            # auto detect browser proxy setting is work
+            return self.wfile.write(self.self_check_response_data)
 
+        self.parsed_url = urlparse.urlparse(self.path)
 
         if host in config.HOSTS_GAE:
             return self.do_AGENT()
@@ -106,7 +121,6 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return self.wfile.write(('HTTP/1.1 301\r\nLocation: %s\r\n\r\n' % self.path.replace('http://', 'https://', 1)).encode())
 
         return self.do_AGENT()
-
 
     # Called by do_METHOD and do_CONNECT_AGENT
     def do_AGENT(self):
@@ -149,64 +163,22 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         gae_handler.handler(self.command, self.path, request_headers, payload, self.wfile)
 
     def do_CONNECT(self):
+        if self.path != "https://www.twitter.com/xxnet":
+            touch_active()
+
         host, _, port = self.path.rpartition(':')
 
         if host in config.HOSTS_GAE:
             return self.do_CONNECT_AGENT()
         if host in config.HOSTS_DIRECT:
             return self.do_CONNECT_DIRECT()
-        if host in config.HOSTS_FWD:
-            return self.do_CONNECT_FWD()
-
 
         if host.endswith(config.HOSTS_GAE_ENDSWITH):
             return self.do_CONNECT_AGENT()
         if host.endswith(config.HOSTS_DIRECT_ENDSWITH):
             return self.do_CONNECT_DIRECT()
-        if host.endswith(config.HOSTS_FWD_ENDSWITH):
-            return self.do_CONNECT_FWD()
 
         return self.do_CONNECT_AGENT()
-
-    def do_CONNECT_FWD(self):
-        """socket forward for http CONNECT command"""
-        host, _, port = self.path.rpartition(':')
-        port = int(port)
-        xlog.info('FWD %s %s:%d ', self.command, host, port)
-        if host == "appengine.google.com" or host == "www.google.com":
-            connected_in_s = 5 # gae_proxy upload to appengine is slow, it need more 'fresh' connection.
-        else:
-            connected_in_s = 10  # gws connect can be used after tcp connection created 15 s
-
-
-        try:
-            self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
-            data = self.connection.recv(1024)
-        except Exception as e:
-            xlog.exception('do_CONNECT_FWD (%r, %r) Exception:%s', host, port, e)
-            self.connection.close()
-            return
-
-        remote = forwork_manager.create_connection(host=host, port=port, sock_life=connected_in_s)
-        if remote is None:
-            self.connection.close()
-            xlog.warn('FWD %s %s:%d create_connection fail', self.command, host, port)
-            return
-
-        try:
-            if data:
-                remote.send(data)
-        except Exception as e:
-            xlog.exception('do_CONNECT_FWD (%r, %r) Exception:%s', host, port, e)
-            self.connection.close()
-            remote.close()
-            return
-
-        # reset timeout default to avoid long http upload failure, but it will delay timeout retry :(
-        remote.settimeout(None)
-
-        forwork_manager.forward_socket(self.connection, remote, bufsize=self.bufsize)
-        xlog.debug('FWD %s %s:%d with closed', self.command, host, port)
 
     def do_CONNECT_AGENT(self):
         """deploy fake cert to client"""
@@ -243,11 +215,13 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.request_version = ''
                 self.command = ''
                 self.send_error(414)
+                xlog.warn("read request line len:%d", len(self.raw_requestline))
                 return
             if not self.raw_requestline:
-                self.close_connection = 1
+                xlog.warn("read request line empty")
                 return
             if not self.parse_request():
+                xlog.warn("parse request fail:%s", self.raw_requestline)
                 return
         except NetWorkIOError as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
@@ -255,18 +229,25 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 raise
         if self.path[0] == '/' and host:
             self.path = 'https://%s%s' % (self.headers['Host'], self.path)
+
+        if self.path == "https://www.twitter.com/xxnet":
+            # for web_ui status page
+            # auto detect browser proxy setting is work
+            xlog.debug("CONNECT %s %s", self.command, self.path)
+            return self.wfile.write(self.self_check_response_data)
+
         xlog.debug('GAE CONNECT %s %s', self.command, self.path)
         if self.command not in self.gae_support_methods:
-            if host.endswith(".google.com") or host.endswith(config.HOSTS_FWD_ENDSWITH) or host.endswith(config.HOSTS_GAE_ENDSWITH):
+            if host.endswith(".google.com") or host.endswith(config.HOSTS_DIRECT_ENDSWITH) or host.endswith(config.HOSTS_GAE_ENDSWITH):
                 if host in config.HOSTS_GAE:
                     gae_set = [s for s in config.HOSTS_GAE]
                     gae_set.remove(host)
                     config.HOSTS_GAE = tuple(gae_set)
-                if host not in config.HOSTS_FWD:
-                    fwd_set = [s for s in config.HOSTS_FWD]
+                if host not in config.HOSTS_DIRECT:
+                    fwd_set = [s for s in config.HOSTS_DIRECT]
                     fwd_set.append(host)
-                    config.HOSTS_FWD = tuple(fwd_set)
-                xlog.warn("Method %s not support in GAE, Redirect to FWD for %s", self.command, self.path)
+                    config.HOSTS_DIRECT = tuple(fwd_set)
+                xlog.warn("Method %s not support in GAE, Redirect to DIRECT for %s", self.command, self.path)
                 return self.wfile.write(('HTTP/1.1 301\r\nLocation: %s\r\n\r\n' % self.path).encode())
             else:
                 xlog.warn("Method %s not support in GAEProxy for %s", self.command, self.path)
@@ -282,7 +263,6 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             return self.do_AGENT()
 
-
         except NetWorkIOError as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ETIMEDOUT, errno.EPIPE):
                 raise
@@ -295,7 +275,6 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     pass
                 finally:
                     self.__realconnection = None
-
 
     def do_CONNECT_DIRECT(self):
         """deploy fake cert to client"""
@@ -346,7 +325,8 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 raise
         if self.path[0] == '/' and host:
             self.path = 'https://%s%s' % (self.headers['Host'], self.path)
-        xlog.debug('GAE CONNECT %s %s', self.command, self.path)
+
+        xlog.debug('GAE CONNECT Direct %s %s', self.command, self.path)
 
         try:
             if self.path[0] == '/' and host:
@@ -374,7 +354,6 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             direct_handler.handler(self.command, host, path, request_headers, payload, self.wfile)
 
-
         except NetWorkIOError as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.ETIMEDOUT, errno.EPIPE):
                 raise
@@ -388,5 +367,3 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 finally:
                     self.__realconnection = None
 
-if __name__ == "__main__":
-    pass
